@@ -1,0 +1,161 @@
+/*
+ * Railway Signal Data Logger with Fault Detection
+ * -----------------------------------------------
+ * Simulates N trackside signals. Every cycle it:
+ *   1. Reads (simulated) sensors: lamp current, track-circuit voltage
+ *   2. Decides the commanded aspect (simple interlocking)
+ *   3. Logs all data to signal_log.csv
+ *   4. Detects faults and writes them to fault_log.txt
+ *
+ * Compile : gcc railway_signal_logger.c -o signal_logger
+ * Run     : ./signal_logger [cycles]     (default 30)
+ * To use real hardware, replace read_sensors() with ADC/serial reads.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define NUM_SIGNALS 4
+#define LOG_FILE    "signal_log.csv"
+#define FAULT_FILE  "fault_log.txt"
+
+/* Thresholds */
+#define LAMP_I_MIN      0.20f  /* A  below -> lamp failure   */
+#define LAMP_I_MAX      0.80f  /* A  above -> short/overload */
+#define TRACK_V_OCC     0.50f  /* V  below -> track occupied */
+#define TRACK_V_CLEAR   1.20f  /* V  above -> track clear    */
+#define TRACK_V_MAX     3.00f  /* V  above -> open/wiring    */
+#define STUCK_LIMIT     8      /* cycles with no change      */
+
+typedef enum { RED, YELLOW, GREEN } Aspect;
+typedef enum {
+    F_NONE = 0, F_LAMP_FAIL = 1, F_OVERCURRENT = 2, F_TRACK_CIRCUIT = 4,
+    F_MISMATCH = 8, F_UNSAFE = 16, F_STUCK = 32
+} Fault;
+
+typedef struct {
+    int    id;
+    Aspect commanded, displayed;
+    float  lamp_current, track_voltage;
+    int    occupied;
+    int    unchanged_cycles;
+    int    faults;
+} Signal;
+
+static const char *aspect_name(Aspect a) {
+    return a == RED ? "RED" : a == YELLOW ? "YELLOW" : "GREEN";
+}
+
+static float frand(float lo, float hi) {
+    return lo + (hi - lo) * ((float)rand() / RAND_MAX);
+}
+
+/* ---- Simulated sensors (replace with real I/O) ---- */
+static void read_sensors(Signal *s) {
+    int occupied_now = (rand() % 100) < 25;                 /* train on track */
+    s->track_voltage = occupied_now ? frand(0.05f, 0.30f) : frand(1.6f, 2.4f);
+    s->lamp_current  = frand(0.40f, 0.55f);
+
+    /* random fault injection (~6% per fault type) */
+    if (rand() % 100 < 6) s->lamp_current  = frand(0.0f, 0.10f);   /* lamp blown */
+    if (rand() % 100 < 4) s->lamp_current  = frand(0.90f, 1.20f);  /* short      */
+    if (rand() % 100 < 5) s->track_voltage = frand(3.2f, 4.5f);    /* open wire  */
+}
+
+/* Simulated lamp-proving feedback: what the signal actually shows */
+static void read_displayed(Signal *s) {
+    s->displayed = s->commanded;
+    if (rand() % 100 < 4) s->displayed = (Aspect)(rand() % 3);   /* mismatch inject */
+}
+
+/* ---- Simple interlocking: decide aspect from track state ---- */
+static Aspect decide_aspect(const Signal *s) {
+    if (s->track_voltage < TRACK_V_OCC) return RED;   /* occupied */
+    return (rand() % 2) ? GREEN : YELLOW;
+}
+
+/* ---- Fault detection ---- */
+static int detect_faults(Signal *s, Aspect prev_displayed) {
+    int f = F_NONE;
+    if (s->lamp_current < LAMP_I_MIN)  f |= F_LAMP_FAIL;
+    if (s->lamp_current > LAMP_I_MAX)  f |= F_OVERCURRENT;
+    if (s->track_voltage > TRACK_V_MAX ||
+        (s->track_voltage > TRACK_V_OCC && s->track_voltage < TRACK_V_CLEAR))
+        f |= F_TRACK_CIRCUIT;
+    if (s->displayed != s->commanded)  f |= F_MISMATCH;
+    s->occupied = (s->track_voltage < TRACK_V_OCC);
+    if (s->occupied && s->displayed != RED) f |= F_UNSAFE;
+
+    s->unchanged_cycles = (s->displayed == prev_displayed) ? s->unchanged_cycles + 1 : 0;
+    if (s->unchanged_cycles >= STUCK_LIMIT) f |= F_STUCK;
+    return f;
+}
+
+static void fault_text(int f, char *buf, size_t n) {
+    buf[0] = '\0';
+    if (f & F_LAMP_FAIL)     snprintf(buf + strlen(buf), n - strlen(buf), "LAMP_FAILURE ");
+    if (f & F_OVERCURRENT)   snprintf(buf + strlen(buf), n - strlen(buf), "OVERCURRENT ");
+    if (f & F_TRACK_CIRCUIT) snprintf(buf + strlen(buf), n - strlen(buf), "TRACK_CIRCUIT_FAULT ");
+    if (f & F_MISMATCH)      snprintf(buf + strlen(buf), n - strlen(buf), "ASPECT_MISMATCH ");
+    if (f & F_UNSAFE)        snprintf(buf + strlen(buf), n - strlen(buf), "UNSAFE_ASPECT ");
+    if (f & F_STUCK)         snprintf(buf + strlen(buf), n - strlen(buf), "SIGNAL_STUCK ");
+    if (!f)                  snprintf(buf, n, "OK");
+}
+
+int main(int argc, char *argv[]) {
+    int cycles = (argc > 1) ? atoi(argv[1]) : 30;
+    Signal sig[NUM_SIGNALS];
+    int total_faults = 0;
+    char ts[32], ftxt[128];
+
+    srand((unsigned)time(NULL));
+
+    FILE *log = fopen(LOG_FILE, "w");
+    FILE *flt = fopen(FAULT_FILE, "w");
+    if (!log || !flt) { perror("file open"); return 1; }
+    fprintf(log, "timestamp,cycle,signal,commanded,displayed,lamp_A,track_V,occupied,status\n");
+
+    for (int i = 0; i < NUM_SIGNALS; i++) {
+        sig[i] = (Signal){ .id = i + 1, .commanded = RED, .displayed = RED };
+    }
+
+    printf("Railway Signal Logger started: %d signals, %d cycles\n", NUM_SIGNALS, cycles);
+    printf("%-5s %-3s %-7s %-7s %-6s %-6s %s\n",
+           "Cyc", "Sig", "Cmd", "Disp", "Lamp A", "Trk V", "Status");
+
+    for (int c = 1; c <= cycles; c++) {
+        for (int i = 0; i < NUM_SIGNALS; i++) {
+            Signal *s = &sig[i];
+            Aspect prev = s->displayed;
+
+            read_sensors(s);
+            s->commanded = decide_aspect(s);
+            read_displayed(s);
+
+            s->faults = detect_faults(s, prev);
+            fault_text(s->faults, ftxt, sizeof ftxt);
+
+            time_t now = time(NULL);
+            strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+            fprintf(log, "%s,%d,%d,%s,%s,%.2f,%.2f,%d,%s\n", ts, c, s->id,
+                    aspect_name(s->commanded), aspect_name(s->displayed),
+                    s->lamp_current, s->track_voltage, s->occupied, ftxt);
+
+            printf("%-5d %-3d %-7s %-7s %-6.2f %-6.2f %s\n", c, s->id,
+                   aspect_name(s->commanded), aspect_name(s->displayed),
+                   s->lamp_current, s->track_voltage, ftxt);
+
+            if (s->faults) {
+                total_faults++;
+                fprintf(flt, "[%s] Cycle %d Signal %d: %s\n", ts, c, s->id, ftxt);
+            }
+        }
+    }
+
+    printf("\nDone. Total fault events: %d\nLogs: %s, %s\n", total_faults, LOG_FILE, FAULT_FILE);
+    fclose(log);
+    fclose(flt);
+    return 0;
+}
